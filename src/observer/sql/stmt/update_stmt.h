@@ -18,27 +18,37 @@ See the Mulan PSL v2 for more details. */
 #include "sql/stmt/stmt.h"
 
 class Table;
+class FieldMeta;
+class FilterStmt;
 
 /**
  * @brief 更新语句
  * @ingroup Statement
+ * @details 当前只支持单字段更新，语法形如 `UPDATE t SET a = 1 WHERE ...`。
+ *          语句层负责找到表与字段、把待更新的值转换成字段类型、并构建过滤条件；
+ *          真正的逐行更新在执行层完成。
  */
 class UpdateStmt : public Stmt
 {
 public:
   UpdateStmt() = default;
-  UpdateStmt(Table *table, Value *values, int value_amount);
+  UpdateStmt(Table *table, const FieldMeta *field_meta, const Value &value, FilterStmt *filter_stmt);
+  ~UpdateStmt() override;
+
+  StmtType type() const override { return StmtType::UPDATE; }
 
 public:
   static RC create(Db *db, const UpdateSqlNode &update_sql, Stmt *&stmt);
 
 public:
-  Table *table() const { return table_; }
-  Value *values() const { return values_; }
-  int    value_amount() const { return value_amount_; }
+  Table           *table() const { return table_; }
+  const FieldMeta *field_meta() const { return field_meta_; }
+  const Value     &value() const { return value_; }
+  FilterStmt      *filter_stmt() const { return filter_stmt_; }
 
 private:
-  Table *table_        = nullptr;
-  Value *values_       = nullptr;
-  int    value_amount_ = 0;
+  Table           *table_       = nullptr;
+  const FieldMeta *field_meta_  = nullptr;
+  Value            value_;                   ///< 已经转换成字段类型的目标值
+  FilterStmt      *filter_stmt_ = nullptr;
 };

@@ -16,6 +16,7 @@ See the Mulan PSL v2 for more details. */
 
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "common/lang/string.h"
 #include "common/log/log.h"
@@ -173,6 +174,64 @@ RC Db::create_table(const char *table_name, span<const AttrInfoSqlNode> attribut
 
   opened_tables_[table_name] = table;
   LOG_INFO("Create table success. table name=%s, table_id:%d", table_name, table_id);
+  return RC::SUCCESS;
+}
+
+RC Db::drop_table(const char *table_name)
+{
+  if (common::is_blank(table_name)) {
+    LOG_WARN("invalid argument. table name is blank");
+    return RC::INVALID_ARGUMENT;
+  }
+
+  auto iter = opened_tables_.find(table_name);
+  if (iter == opened_tables_.end()) {
+    LOG_WARN("no such table. db=%s, table_name=%s", name_.c_str(), table_name);
+    return RC::SCHEMA_TABLE_NOT_EXIST;
+  }
+
+  Table *table = iter->second;
+
+  // 先把索引名存下来：Table 析构之后表元数据就访问不到了，但删除索引文件还需要索引名
+  vector<string>   index_names;
+  const TableMeta &table_meta = table->table_meta();
+  const int        index_num  = table_meta.index_num();
+  for (int i = 0; i < index_num; i++) {
+    index_names.emplace_back(table_meta.index(i)->name());
+  }
+
+  // 从 catalog 摘掉这个表，再从内存中释放。
+  // 注意析构顺序的作用：
+  //  - HeapTableEngine 析构会关闭数据文件的 DiskBufferPool，而 DiskBufferPool::close_file()
+  //    内部会回调 BufferPoolManager::close_file() 把该文件从 buffer pool 表中摘除；
+  //  - 每个索引析构时会关闭自己的 B+ 树缓冲池，同样从 buffer pool 表中摘除。
+  // 如果漏掉这一步，同名表重建时 BufferPoolManager::open_file() 会返回 BUFFERPOOL_OPEN。
+  opened_tables_.erase(iter);
+  delete table;
+  table = nullptr;
+
+  // 文件已经关掉，现在可以安全地物理删除。删除失败只记日志，不影响删表结果
+  // （比如 lob 文件在没有大字段时本来就不存在）。
+  const string base_dir  = path_;
+  const string meta_file = table_meta_file(base_dir.c_str(), table_name);
+  const string data_file = table_data_file(base_dir.c_str(), table_name);
+  const string lob_file  = table_lob_file(base_dir.c_str(), table_name);
+
+  auto remove_file = [](const string &file_name) {
+    if (0 != unlink(file_name.c_str())) {
+      LOG_INFO("file is not removed. file=%s, errno=%d:%s", file_name.c_str(), errno, strerror(errno));
+    }
+  };
+
+  remove_file(meta_file);
+  remove_file(data_file);
+  remove_file(lob_file);
+
+  for (const string &index_name : index_names) {
+    remove_file(table_index_file(base_dir.c_str(), table_name, index_name.c_str()));
+  }
+
+  LOG_INFO("Drop table success. table name=%s, index num=%d", table_name, index_num);
   return RC::SUCCESS;
 }
 

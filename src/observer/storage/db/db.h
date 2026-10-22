@@ -71,6 +71,15 @@ public:
       const StorageFormat storage_format = StorageFormat::ROW_FORMAT);
 
   /**
+   * @brief 删除一个表
+   * @details 会先释放表在内存中的资源（记录句柄、数据文件缓冲池、所有索引），
+   *          再删除磁盘上的元数据文件、数据文件、索引文件与 lob 文件。
+   *          这里没有做并发控制，调用者需要保证当前没有其他线程正在访问该表。
+   * @param table_name 表名
+   */
+  RC drop_table(const char *table_name);
+
+  /**
    * @brief 根据表名查找表
    */
   Table *find_table(const char *table_name) const;

@@ -100,8 +100,8 @@ cd test/case && python3 miniob_test.py --test-cases=basic
 | CREATE/DROP INDEX | ✅ | ✅ | ✅ | `index_scan` ✅ |
 | GROUP BY | ✅ `GROUP` | ✅ | ✅ | `group_by`/`hash_group_by`/`scalar_group_by` ✅ |
 | 聚合函数 | ❌ 无 COUNT/SUM/AVG/MIN/MAX 关键字 | ❓ | — | `aggregate_vec` ✅ |
-| **DROP TABLE** | ✅ `DROP` | ✅ 生成 `SCF_DROP_TABLE` | ❌ **无 DropTableStmt，`Stmt::create_stmt` 无 case** | — |
-| **UPDATE** | ✅ `UPDATE` | ⚠️ 仅支持**单字段**赋值 | ❌ **`UpdateStmt::create` 是空壳（`// TODO` + `return RC::INTERNAL`）** | ❌ 无 |
+| **DROP TABLE** | ✅ `DROP` | ✅ 生成 `SCF_DROP_TABLE` | ✅ `DropTableStmt` + Executor | `Db::drop_table` 回收 |
+| **UPDATE** | ✅ `UPDATE` | ⚠️ 仅支持**单字段**赋值 | ✅ `UpdateStmt` 已实现 | ✅ `UpdatePhysicalOperator` |
 | **JOIN / INNER JOIN** | ❌ | ❌ `rel_list` 仅支持逗号分隔 | — | ✅ **`join`/`nested_loop_join`/`hash_join` 已存在** |
 | ORDER BY | ❌ | ❌ | ❌ | ❌ |
 | UNION | ❌ | ❌ | ❌ | ❌ |
@@ -294,73 +294,99 @@ cd test/case && python3 miniob_test.py --test-cases=basic
 
 ---
 
-### 5.4 DROP TABLE ⬜
+### 5.4 DROP TABLE 🔧
 
 **要求**：删除表，并**清除所有关联资源**（数据页、索引等）。删除后再 `select` 该表应返回 `FAILURE`（元数据校验）。
 
-**现状**：语法**已通**——`yacc_sql.y` 的 `drop_table_stmt` 产生式已生成 `ParsedSqlNode(SCF_DROP_TABLE)`；但**没有 `DropTableStmt` 类**，`Stmt::create_stmt` 也无 `SCF_DROP_TABLE` 分支，因此落到默认分支返回 `FAILURE`。
+**初始现状**：语法**已通**——`yacc_sql.y` 的 `drop_table_stmt` 产生式已生成 `ParsedSqlNode(SCF_DROP_TABLE)`；但没有 `DropTableStmt` 类，`Stmt::create_stmt` 也无 `SCF_DROP_TABLE` 分支，因此落到默认分支返回 `FAILURE`。
 
-**实现思路**
+#### 实现记录（已完成）
 
-1. 新建 `sql/stmt/drop_table_stmt.h/.cpp`：`create()` 校验表存在 → 组装 `DropTableStmt`。
-2. `stmt.cpp` 的 `Stmt::create_stmt` 增加 `case SCF_DROP_TABLE`。
-3. 执行层：在 `Db` 层实现删表
-   - 从 catalog 移除表元数据
-   - 释放数据页 / 删除表数据文件
-   - **遍历并删除该表上的所有索引**（B+ 树文件也要删）
-4. 元数据校验：`select/insert/update/delete` 前确认表存在，删除后访问返回 `FAILURE`。
+**1. 语句层**：新增 `DropTableStmt`（`sql/stmt/drop_table_stmt.h/.cpp`），`create()` 做元数据校验——表不存在直接返回 `RC::SCHEMA_TABLE_NOT_EXIST`，对应「drop 不存在的表返回 FAILURE」。
 
-**涉及文件**：`sql/stmt/drop_table_stmt.*`（新建）、`sql/stmt/stmt.cpp`、`storage/db/db.*`、`storage/table/table.*`、`storage/index/*`
+**2. 执行层**：新增 `DropTableExecutor`（`sql/executor/drop_table_executor.h/.cpp`），注册到 `CommandExecutor` 的 `StmtType::DROP_TABLE` 分支。因为是 DDL，`CommandExecutor` 会自动在之后执行 `Db::sync()`。
+
+**3. 资源回收**：核心是 `Db::drop_table()`，顺序很关键：
+
+```
+① 先记录索引名 → ② opened_tables_.erase → ③ delete table → ④ unlink 各文件
+```
+
+为什么是这个顺序：
+
+- **索引名必须先取**：`delete table` 后表元数据就没了，但删索引文件还要用到索引名；
+- **`delete table` 负责内存资源**：`~Table` 删 lob handler，`~HeapTableEngine` 删 record handler、关闭数据文件的 `DiskBufferPool`、逐个 `delete` 索引（`~BplusTreeIndex` 会关闭 B+ 树缓冲池）；
+- **这一步同时解决「同名重建」问题**：`DiskBufferPool::close_file()` 内部会回调 `BufferPoolManager::close_file()` 把文件从 buffer pool 表里摘除，索引同理。**如果漏掉，`CREATE TABLE` 同名表时 `BufferPoolManager::open_file()` 会返回 `BUFFERPOOL_OPEN` 而失败**——这正是 `primary-drop-table.test` 第 5 组用例专门考察的场景；
+- **文件最后删**：此时 fd 已关闭、页已 purge，`unlink` 才安全。删除失败只记日志（lob 文件在没有大字段时本就不存在）。
+
+**涉及文件**：`sql/stmt/drop_table_stmt.*`（新建）、`sql/executor/drop_table_executor.*`（新建）、`sql/stmt/stmt.cpp`、`sql/executor/command_executor.cpp`、`storage/db/db.h`、`storage/db/db.cpp`
 
 **知识点**
-- Catalog（系统表）管理
-- 资源生命周期与回收（页、文件、索引句柄）
+- Catalog 管理：`opened_tables_` 作为内存中的表目录
+- 资源生命周期与回收顺序（对象析构 → 缓冲池注销 → 文件删除）
+- **缓冲池管理器与磁盘文件的注册关系**：`open_file`/`close_file` 的成对使用，否则同名对象重建会撞 `BUFFERPOOL_OPEN`
+- DDL 后的元数据持久化（`Db::sync()`）
 - 元数据校验与错误返回规范
 
-**验证**：本地 `primary-drop-table.test`；平台 `drop-table` 用例
+**验证**：⏳ 待编译验证。本地 `primary-drop-table.test`；平台 `drop-table` 用例
 
 ---
 
-### 5.5 UPDATE ⬜
+### 5.5 UPDATE 🔧
 
 **要求**：实现单字段更新，支持带 where 和不带 where；更新需同步索引；元数据校验（表/字段不存在 → `FAILURE`）；where 查不到数据 → 仍返回 `SUCCESS`；类型不可转换 → `FAILURE`。
 
-**现状**：
-- 语法：`UPDATE ID SET ID EQ value where` —— **仅单字段**，多字段赋值需扩展
-- `UpdateStmt::create` 是**空壳**：
+**初始现状**：
+- 语法已有：`UPDATE ID SET ID EQ value where`，**仅支持单字段**
+- `UpdateStmt::create` 是空壳（`// TODO` + `return RC::INTERNAL`），且没实现 `type()`（所以是个抽象类）
+- `Stmt::create_stmt` 无 `SCF_UPDATE` 分支，`LogicalOperatorType`/`PhysicalOperatorType` 也没有 UPDATE
+- 注：`OpType` 里 **`LOGICALUPDATE` 和 `UPDATE` 是预置好的**，不用改
 
-  ```cpp
-  RC UpdateStmt::create(Db *db, const UpdateSqlNode &update, Stmt *&stmt)
-  {
-    // TODO
-    stmt = nullptr;
-    return RC::INTERNAL;
-  }
-  ```
-- `Stmt::create_stmt` **无 `SCF_UPDATE` 分支**
-- 无 `UpdatePhysicalOperator`
+#### 实现记录（已完成）
 
-**实现思路**
+**1. 语句层**：重写 `UpdateStmt`，持有「表 + 字段元数据 + 已转换的值 + 过滤条件」，并补上 `type()`。`create()` 做四道校验：
 
-1. **Stmt**：实现 `UpdateStmt::create` —— 打开表、校验字段存在、构造待更新 `Value`（含类型转换与校验）、保存 where 条件。
-2. **接进 `create_stmt`**：加 `case SCF_UPDATE`。
-3. **逻辑计划**：`UpdateLogicalOperator`（表 + 字段 + 值 + 谓词）。
-4. **物理计划**：新建 `update_physical_operator.h/.cpp`，**仿 `delete_physical_operator`**：
-   - 子算子产出待更新行（`TableScan` + `Predicate`）
-   - 对每行：先构造新记录 → **删除旧记录 + 插入新记录**（比原地覆盖更安全，能正确处理变长字段与索引）
-   - **同步更新索引**：删旧键、插新键；若更新的是索引列，务必用旧值删、新值插
-5. **事务/MVCC**：在事务上下文中执行，失败要能回滚（`update-mvcc` 会专门考察）。
-6. **空结果集**：无匹配行时不报错，返回 `SUCCESS`（符合输出规范）。
+| 场景 | 处理 | 期望输出 |
+|---|---|---|
+| 表不存在 | `RC::SCHEMA_TABLE_NOT_EXIST` | `FAILURE` |
+| 字段不存在 | `RC::SCHEMA_FIELD_NOT_EXIST` | `FAILURE` |
+| WHERE 里的字段非法 | `FilterStmt::create` 失败 | `FAILURE` |
+| 值无法转成字段类型（如 `SET col1='N01'`） | `Value::cast_to` 失败 → `SCHEMA_FIELD_TYPE_MISMATCH` | `FAILURE` |
 
-**涉及文件**：`sql/stmt/update_stmt.cpp`、`sql/stmt/stmt.cpp`、`sql/operator/update_logical_operator.*`（新建）、`sql/operator/update_physical_operator.*`（新建）、`sql/executor/*`（执行入口）
+**2. 执行方式：删除旧记录 + 插入新记录**，而不是原地覆盖。
+
+这么选的理由：
+- 插入/删除路径已经处理好了索引维护，直接复用**不会漏掉索引键的变更**（`update` 用例第 3 组就是把索引列 `id` 改掉）；
+- 原地覆盖要自己处理「删旧索引键 + 插新索引键」、变长字段长度变化、页内空间不足等一堆情况，风险大得多。
+
+**3. 物理算子的两个关键细节**
+
+- **必须先深拷贝命中的记录再更新**：`copy_data()` 会把记录内容拷到独立内存，并保留 `rid`。若直接持有扫描元组的 `Record`（它指向页面），后续删除/插入会打乱页面，导致读到脏数据。
+- **写字段前先清零**：`write_value_to_field()` 先 `reset_filed(offset, len)` 再 `set_field(offset, copy_len, data)`。因为 `char(20)` 存 `'abc'` 时字段宽度远大于有效长度，直接按 `field->len()` 拷贝会**读越界并写入脏字节**；清零后行为与插入路径（`Table::set_value_to_record`）一致。
+
+**4. 失败恢复**：插入新记录失败时，会把旧记录重新插回去，避免「删了但没插上」导致丢数据。
+
+**改动清单**
+
+| 文件 | 改动 |
+|---|---|
+| `sql/stmt/update_stmt.h/.cpp` | 重写：新成员与 `create()` 实现 |
+| `sql/stmt/stmt.cpp` | 加 `case SCF_UPDATE` |
+| `sql/operator/logical_operator.h` | 枚举加 `UPDATE` |
+| `sql/operator/physical_operator.h/.cpp` | 枚举加 `UPDATE` + 名称映射 |
+| `sql/operator/update_logical_operator.h` | **新建** |
+| `sql/operator/update_physical_operator.h/.cpp` | **新建**，核心执行逻辑 |
+| `sql/optimizer/logical_plan_generator.h/.cpp` | 加 case 与 `create_plan(UpdateStmt*)` |
+| `sql/optimizer/physical_plan_generator.h/.cpp` | 加 case 与 `create_plan(UpdateLogicalOperator&)` |
 
 **知识点**
-- 逻辑计划 → 物理计划的转换
-- 谓词下推与行迭代模型（`PhysicalOperator::next/current_tuple`）
-- 索引维护一致性（删旧键/插新键）
-- 更新的原子性与回滚
+- 逻辑计划 → 物理计划的转换；DML 算子如何挂到 `PhysicalOperator` 树上
+- 火山模型的行迭代（`open` 里一次性拉完子算子再处理，避免边扫边改）
+- 索引维护一致性（复用插入/删除路径，删旧键/插新键）
+- 变长字段写入的边界处理（清零 + 截断）
+- 更新的失败恢复（回插旧记录）
 
-**验证**：本地 `primary-update.test`；平台 `update` 用例
+**验证**：⏳ 待编译验证。本地 `primary-update.test`；平台 `update` 用例
 
 ---
 
@@ -757,3 +783,5 @@ git rev-parse HEAD        # 拿到新 commit id
 |---|---|
 | 2026-10-15 | 建立基线：提测 10.000（basic 通过，23 项失败）；完成代码现状核查与依赖分析；新增 `tools/linux-setup.sh` 自测脚本；撰写本报告初版 |
 | 2026-10-22 | **实现 DATE 类型**：`AttrType::DATES` + `DateType`（`YYYYMMDD` 整数编码）+ `Value` 分支 + lexer/yacc 关键字 + `CharType` 向日期隐式转换；索引与输出走通用路径。⏳ 待编译验证 |
+| 2026-10-22 | **实现 DROP TABLE**：`DropTableStmt` + `DropTableExecutor` + `Db::drop_table`（按「记索引名 → 摘 catalog → 析构释放缓冲池 → unlink 文件」的顺序回收资源，保证同名表可重建）。⏳ 待编译验证 |
+| 2026-10-22 | **实现 UPDATE**：重写 `UpdateStmt`（四道校验）、新增 `UpdateLogicalOperator`/`UpdatePhysicalOperator`（删除旧记录 + 插入新记录以复用索引维护）、接入两层计划生成器；处理变长字段清零与失败回插。⏳ 待编译验证 |
