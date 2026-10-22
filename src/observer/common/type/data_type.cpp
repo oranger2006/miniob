@@ -9,6 +9,7 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #include "common/type/char_type.h"
+#include "common/type/date_type.h"
 #include "common/type/float_type.h"
 #include "common/type/integer_type.h"
 #include "common/type/data_type.h"
@@ -17,11 +18,13 @@ See the Mulan PSL v2 for more details. */
 // Todo: 实现新数据类型
 // your code here
 
+// 注意：数组下标必须与 AttrType 枚举的取值顺序严格一致
 array<unique_ptr<DataType>, static_cast<int>(AttrType::MAXTYPE)> DataType::type_instances_ = {
     make_unique<DataType>(AttrType::UNDEFINED),
     make_unique<CharType>(),
     make_unique<IntegerType>(),
     make_unique<FloatType>(),
+    make_unique<DateType>(),
     make_unique<VectorType>(),
     make_unique<DataType>(AttrType::BOOLEANS),
 };

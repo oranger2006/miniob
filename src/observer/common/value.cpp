@@ -116,7 +116,8 @@ void Value::set_data(char *data, int length)
     case AttrType::CHARS: {
       set_string(data, length);
     } break;
-    case AttrType::INTS: {
+    case AttrType::INTS:
+    case AttrType::DATES: {
       value_.int_value_ = *(int *)data;
       length_           = length;
     } break;
@@ -155,6 +156,19 @@ void Value::set_boolean(bool val)
   attr_type_         = AttrType::BOOLEANS;
   value_.bool_value_ = val;
   length_            = sizeof(val);
+}
+
+/**
+ * @brief 设置日期值
+ * @param val 形如 YYYYMMDD 的整数（如 2022-10-10 对应 20221010）
+ * @details 日期在内部复用 4 字节整数存储，因此长度与 int 一致。
+ */
+void Value::set_date(int val)
+{
+  reset();
+  attr_type_        = AttrType::DATES;
+  value_.int_value_ = val;
+  length_           = sizeof(val);
 }
 
 void Value::set_string(const char *s, int len /*= 0*/)
@@ -202,6 +216,9 @@ void Value::set_value(const Value &value)
     } break;
     case AttrType::CHARS: {
       set_string(value.get_string().c_str());
+    } break;
+    case AttrType::DATES: {
+      set_date(value.get_int());
     } break;
     case AttrType::BOOLEANS: {
       set_boolean(value.get_boolean());
@@ -259,6 +276,9 @@ int Value::get_int() const
       }
     }
     case AttrType::INTS: {
+      return value_.int_value_;
+    }
+    case AttrType::DATES: {
       return value_.int_value_;
     }
     case AttrType::FLOATS: {

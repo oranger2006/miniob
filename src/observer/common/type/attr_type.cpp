@@ -12,7 +12,8 @@ See the Mulan PSL v2 for more details. */
 #include "common/lang/string.h"
 #include "common/type/attr_type.h"
 
-const char *ATTR_TYPE_NAME[] = {"undefined", "chars", "ints", "floats", "vectors", "booleans"};
+// 注意：数组下标必须与 AttrType 枚举的取值顺序严格一致
+const char *ATTR_TYPE_NAME[] = {"undefined", "chars", "ints", "floats", "dates", "vectors", "booleans"};
 
 const char *attr_type_to_string(AttrType type)
 {

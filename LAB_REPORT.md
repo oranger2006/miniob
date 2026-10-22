@@ -108,7 +108,7 @@ cd test/case && python3 miniob_test.py --test-cases=basic
 | CREATE VIEW | ❌ | ❌ | ❌ | ❌ |
 | ALTER TABLE | ❌ | ❌ | ❌ | ❌ |
 | UNIQUE INDEX | ❌ | ❌ | ❌ | ❌ |
-| DATE | ❌ | ❌ | `AttrType` 无 `DATES` | ❌ |
+| **DATE** | ✅ `DATE` | ✅ `type` 产生式 | ✅ `DateType` 已实现 | ✅ 通用比较路径 |
 | TEXT | ❌ | ❌ | `AttrType` 无 `TEXTS` | ❌ |
 | NULL | ❌ | ❌ | ❌ | ❌ |
 | **VECTOR** | ✅ `VECTOR` | ✅ 仅 `VECTOR`（**不支持 `VECTOR(N)`**） | ⚠️ `VectorType` 是**桩**：`compare` 恒返回 `INT32_MAX`，`to_string` 返回 `UNIMPLEMENTED` | ❌ |
@@ -201,39 +201,70 @@ cd test/case && python3 miniob_test.py --test-cases=basic
 
 ---
 
-### 5.2 DATE ⬜
+### 5.2 DATE 🔧
 
 **要求**：实现 `date` 字段类型，支持建表、插入、比较、索引、输出。
-- 合法范围：1970-01-01 ~ 2038-02（可用 32 位整数存）
-- 非法日期（如 `2021-2-31`）必须返回 `FAILURE`
-- 需处理闰年；`where d='2021-02-30'` 返回 `FAILURE`（注意与 MySQL 返回空集不同，此处以题目约定为准）
-- 输出格式 `YYYY-mm-DD`
+- 取值范围**不是** Unix 时间戳能覆盖的：测试可能**早于 1970-01-01**、也**晚于 2038-02**（所以不能用 32 位秒级时间戳）
+- 非法日期（如 `2021-2-31`、`2017-2-29` 非闰年、`2017-11-31` 11 月无 31 日）必须返回 `FAILURE`
+- 需处理闰年；`where d='2017-2-29'` 返回 `FAILURE`（注意与 MySQL 返回空集不同，此处以题目约定为准）
+- 输出格式 `YYYY-mm-DD`（补零）
 
-**现状**：`AttrType` 只有 `UNDEFINED/CHARS/INTS/FLOATS/VECTORS/BOOLEANS`，**无 `DATES`**；lexer/yacc 无 `DATE` 关键字；无 `DateType` 类。
+**初始现状**：`AttrType` 只有 `UNDEFINED/CHARS/INTS/FLOATS/VECTORS/BOOLEANS`，无 `DATES`；lexer/yacc 无 `DATE` 关键字；无 `DateType` 类。
 
-**实现思路**
+#### 实现记录（已完成）
 
-1. **类型注册**：`common/type/attr_type.h` 增加 `DATES`；`attr_type.cpp` 补充 `attr_type_to_string` / `string_to_attr_type` 的双向映射。
-2. **类型实现**：新建 `common/type/date_type.h/.cpp`，继承 `DataType`，实现：
-   - `compare(left, right)` —— 按整数比较
-   - `to_string(val, result)` —— 整数转 `YYYY-mm-DD`
-   - `cast` 相关（字符串 `'2021-1-2'` → 整数，需容忍月份/日期不补零）
-3. **类型工厂**：`data_type.cpp` 中把 `DATES` 注册进工厂，否则 `DataType::type_instance` 取不到。
-4. **语法**：`lex_sql.l` 加 `DATE RETURN_TOKEN(DATE)`；`yacc_sql.y` 的 type 产生式加 `| DATE { $$ = static_cast<int>(AttrType::DATES); }`。
-5. **存储**：字段长度按 4 字节（`INTS` 同款），`record_manager` 无需改动。
-6. **合法性校验**：在**插入/更新时的类型转换**环节校验（年/月/日范围、月天数、闰年 2 月 29），非法直接返回 `RC::INVALID_ARGUMENT`，使上层输出 `FAILURE`。
-7. **索引**：`date` 建立在 `INTS` 存储之上，B+ 树比较自动可用，但要确认 `Value` 的比较走的是 `DateType::compare`。
-8. **输出**：`Value::to_string` 走 `DateType::to_string`，保证 `YYYY-mm-DD` 补零。
+**核心设计：内部用 `int32` 表示 `YYYYMMDD`**
 
-**涉及文件**：`common/type/attr_type.h`、`common/type/attr_type.cpp`、`common/type/date_type.*`（新建）、`common/type/data_type.cpp`、`sql/parser/lex_sql.l`、`sql/parser/yacc_sql.y`、`common/value.*`
+日期在存储上占 **4 字节**，值为 `year*10000 + month*100 + day`（例：`2022-10-10` → `20221010`）。
+
+选这个编码而不是「距 1970-01-01 的天数」或 Unix 时间戳，理由有三条：
+1. **覆盖范围足够**：`year ∈ [1, 9999]` 都不会超出 `int32`，天然满足「早于 1970、晚于 2038」的要求；
+2. **数值大小与日期先后一致**（`20221231 < 20230101`），所以**日期比较可以直接退化成整数比较**，`DateType::compare` 和 B+ 树索引键比较都不用额外处理；
+3. **代码量最小**：`Value` 的 union 里已有 `int32_t`，不需要扩展存储。
+
+**改动清单**
+
+| 文件 | 改动 |
+|---|---|
+| `common/type/attr_type.h` | 枚举在 `FLOATS` 后插入 `DATES` |
+| `common/type/attr_type.cpp` | 名称表同步插入 `"dates"`（下标必须与枚举严格对齐） |
+| `common/type/date_type.h/.cpp` | **新建** `DateType`：`compare`（含 `Column` 版本）、`cast_to`（→CHARS）、`set_value_from_str`、`to_string`，以及 `parse_date` / `format_date` / `is_leap_year` / `days_in_month` 静态工具 |
+| `common/type/data_type.cpp` | 类型工厂按新枚举顺序注册 `make_unique<DateType>()` |
+| `common/value.h/.cpp` | `friend class DateType`；新增 `set_date()`；`set_data`/`set_value`/`get_int` 补 `DATES` 分支 |
+| `common/type/char_type.cpp` | `cast_to` 支持 `CHARS→DATES`（解析+校验，失败返回错误）；`cast_cost(DATES)=1` |
+| `sql/parser/lex_sql.l` | 新增关键字 `DATE`（lexer 已 `case-insensitive`，`date`/`DATE` 都识别） |
+| `sql/parser/yacc_sql.y` | `%token DATE`；`type` 产生式新增 `| DATE` |
+| `sql/expr/expression.cpp` | 向量化按列比较时把 `DATES` 并入整数分支 |
+| `storage/common/codec.h` | `encode_value` 补 `DATES`（LSM 引擎键编码，与整数一致） |
+
+**关键机制说明**
+
+- **字符串 → 日期**这一跳是整个题目的枢纽。实测链路是：
+  `INSERT` 的字符串字面量先成为 `CHARS` 类型 `Value`，由 `Table::make_record` 里的 `Value::cast_to(value, field->type(), ...)` 触发 `CharType::cast_to(DATES)`；解析或校验失败即返回错误，插入随之 `FAILURE`。
+- **`where d = '2020-1-1'` 能工作的原因**：`LogicalPlanGenerator` 在构建谓词时用 `cast_cost` 决定往哪边转。把 `CharType::cast_cost(DATES)` 从 `INT32_MAX` 改成 `1` 后，右侧字符串会被转成 `DATES` 再比较；**转换失败会让整条语句失败**，正好满足「非法日期查询返回 FAILURE」的约定。
+- **索引无需额外改动**：`bplus_tree.h` 的 `AttrComparator` 走的是 `DataType::type_instance(type)->compare(...)`，属于通用路径，`DateType::compare` 一接上即生效（`BPlusTree` 只有 `CHARS` 有范围扫描特判，`DATES` 不受影响）。
+- **元数据持久化安全**：`FieldMeta` 用字符串存类型（`attr_type_to_string`/`attr_type_from_string`），所以 `"dates"` 能正确往返，不受枚举下标变化影响。
+
+**已覆盖的合法性校验**
+
+| 输入 | 结果 | 判定依据 |
+|---|---|---|
+| `2020-1-01`、`2020-01-1`、`1970-1-1` | 合法 | 月/日允许 1~2 位 |
+| `2016-2-29` | 合法 | 2016 是闰年 |
+| `2017-2-29` | `FAILURE` | 2017 非闰年，2 月只有 28 天 |
+| `2017-21-29` | `FAILURE` | 月份 > 12 |
+| `2017-12-32` | `FAILURE` | 12 月只有 31 天 |
+| `2017-11-31` | `FAILURE` | 11 月只有 30 天 |
+| 空串 / `2020-1` / `2020-1-1-1` / 含非数字字符 | `FAILURE` | 段数或字符非法 |
 
 **知识点**
 - 数据类型扩展的**完整链路**：词法 → 语法 → 类型工厂 → `Value` → 记录存储 → 输出格式化
-- 定长字段的存储与对齐
-- 日期合法性校验（闰年规则）、日期与整数的相互转换
-- 索引键比较依赖类型的 `compare` 实现
+- 定长字段的存储与对齐；用整数编码表达有序语义（`YYYYMMDD` 的单调性）
+- 日期合法性校验（闰年规则、每月天数）
+- 隐式类型转换的**方向选择**（`cast_cost` 决定把字符串转成日期，而不是反向）
+- 索引键比较复用类型的 `compare` 实现
 
-**验证**：本地 `test/case/test/primary-date.test`；平台 `date` 用例
+**验证**：⏳ 待编译验证。本地 `test/case/test/primary-date.test`；平台 `date` 用例
 
 ---
 
@@ -725,3 +756,4 @@ git rev-parse HEAD        # 拿到新 commit id
 | 日期 | 内容 |
 |---|---|
 | 2026-10-15 | 建立基线：提测 10.000（basic 通过，23 项失败）；完成代码现状核查与依赖分析；新增 `tools/linux-setup.sh` 自测脚本；撰写本报告初版 |
+| 2026-10-22 | **实现 DATE 类型**：`AttrType::DATES` + `DateType`（`YYYYMMDD` 整数编码）+ `Value` 分支 + lexer/yacc 关键字 + `CharType` 向日期隐式转换；索引与输出走通用路径。⏳ 待编译验证 |

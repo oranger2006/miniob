@@ -238,7 +238,8 @@ RC ComparisonExpr::eval(Chunk &chunk, vector<uint8_t> &select)
     LOG_WARN("cannot compare columns with different types");
     return RC::INTERNAL;
   }
-  if (left_column.attr_type() == AttrType::INTS) {
+  if (left_column.attr_type() == AttrType::INTS || left_column.attr_type() == AttrType::DATES) {
+    // DATE 内部用 YYYYMMDD 整数存储，大小顺序与日期先后一致，可直接按整数比较
     rc = compare_column<int>(left_column, right_column, select);
   } else if (left_column.attr_type() == AttrType::FLOATS) {
     rc = compare_column<float>(left_column, right_column, select);
